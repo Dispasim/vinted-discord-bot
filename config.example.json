@@ -1,0 +1,28 @@
+{
+  "discord_token": "COLLE_ICI_LE_TOKEN_DE_TON_BOT",
+  "check_interval_seconds": 60,
+  "destinations": [
+    {
+      "name": "Serveur des potes",
+      "channel_id": 123456789012345678,
+      "role_id": 123456789012345678,
+      "searches": [
+        {
+          "name": "Exemple - Jordan 4",
+          "url": "https://www.vinted.fr/catalog?search_text=jordan%204&order=newest_first&price_to=150"
+        }
+      ]
+    },
+    {
+      "name": "Serveur perso",
+      "channel_id": 987654321098765432,
+      "role_id": 987654321098765432,
+      "searches": [
+        {
+          "name": "Exemple - Nike Tech Fleece",
+          "url": "https://www.vinted.fr/catalog?search_text=nike+tech+fleece&order=newest_first&size_ids[]=207"
+        }
+      ]
+    }
+  ]
+}

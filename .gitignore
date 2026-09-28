@@ -1,0 +1,5 @@
+config.json
+seen_items.json
+__pycache__/
+*.pyc
+.history/

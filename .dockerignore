@@ -1,0 +1,7 @@
+config.json
+config.example.json
+seen_items.json
+__pycache__/
+*.pyc
+.git/
+README.md

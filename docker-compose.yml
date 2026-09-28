@@ -1,0 +1,8 @@
+services:
+  vinted-bot:
+    build: .
+    container_name: vinted-bot
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./seen_items.json:/app/seen_items.json
