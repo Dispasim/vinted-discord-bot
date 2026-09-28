@@ -1,6 +1,8 @@
 import asyncio
+import html
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse, parse_qsl
@@ -75,83 +77,91 @@ def build_search(url: str, _depth: int = 0) -> dict:
         )
 
     params["order"] = "newest_first"
-    params["per_page"] = "20"
     return {"domain": domain, "params": params}
+
+
+# Vinted rend désormais les annonces directement dans le HTML de la page de
+# recherche (plus d'appel JSON séparé) : on extrait chaque annonce via son
+# bloc image (id + photo + texte alt) puis son lien associé (URL de l'item).
+ITEM_IMAGE_RE = re.compile(r'data-testid="product-item-id-(\d+)--image"><img src="([^"]+)" alt="([^"]*)"')
+ITEM_HREF_RE = re.compile(r'href="(/items/(\d+)-[^"?]*)')
+PRICE_TOKEN_RE = re.compile(r"^\d+[.,]\d{2}\s")
+
+
+def parse_items_from_html(body: str, domain: str) -> list[dict]:
+    hrefs = {item_id: path for path, item_id in ITEM_HREF_RE.findall(body)}
+
+    items = []
+    for item_id, photo_url, alt in ITEM_IMAGE_RE.findall(body):
+        href = hrefs.get(item_id)
+        if href is None:
+            continue
+        parts = [p.strip() for p in html.unescape(alt).split(",") if p.strip()]
+        title = parts[0] if parts else "Annonce Vinted"
+        prices = [p for p in parts[1:] if PRICE_TOKEN_RE.match(p)]
+        extra = [p for p in parts[1:] if not PRICE_TOKEN_RE.match(p)]
+        items.append(
+            {
+                "id": item_id,
+                "title": title,
+                "price": prices[0] if prices else "?",
+                "extra": ", ".join(extra) if extra else None,
+                "photo": html.unescape(photo_url),
+                "url": f"https://{domain}{href}",
+            }
+        )
+    return items
 
 
 class VintedClient:
     def __init__(self):
         self._session: aiohttp.ClientSession | None = None
-        self._cookie_domains: set[str] = set()
 
     async def start(self):
         self._session = aiohttp.ClientSession(
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json, text/plain, */*"}
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
         )
 
     async def close(self):
         if self._session:
             await self._session.close()
 
-    async def _ensure_cookies(self, domain: str):
-        if domain in self._cookie_domains:
-            return
-        try:
-            async with self._session.get(f"https://{domain}/", timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                await resp.read()
-                self._cookie_domains.add(domain)
-        except Exception as exc:
-            log.warning("Impossible de récupérer les cookies pour %s: %s", domain, exc)
-
     async def fetch_items(self, domain: str, params: dict) -> list[dict]:
-        await self._ensure_cookies(domain)
-        api_url = f"https://{domain}/api/v2/catalog/items"
+        url = f"https://{domain}/catalog"
         for attempt in range(2):
-            async with self._session.get(
-                api_url, params=params, timeout=aiohttp.ClientTimeout(total=20)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("items", [])
-                if resp.status in (401, 403) and attempt == 0:
-                    log.info("Cookies expirés pour %s, on les rafraîchit...", domain)
-                    self._cookie_domains.discard(domain)
-                    await self._ensure_cookies(domain)
-                    continue
-                text = await resp.text()
-                log.warning("Vinted a répondu %s pour %s: %s", resp.status, domain, text[:200])
-                return []
+            try:
+                async with self._session.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=20)
+                ) as resp:
+                    if resp.status == 200:
+                        body = await resp.text()
+                        items = parse_items_from_html(body, domain)
+                        if not items:
+                            log.warning(
+                                "Aucune annonce détectée sur la page de recherche pour %s "
+                                "(structure de page changée côté Vinted ?).",
+                                domain,
+                            )
+                        return items
+                    log.warning(
+                        "Vinted a répondu %s pour %s (tentative %d/2)", resp.status, domain, attempt + 1
+                    )
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                log.warning("Erreur réseau vers %s: %s", domain, exc)
+            await asyncio.sleep(3)
         return []
 
 
-def format_price(item: dict) -> str:
-    price = item.get("total_item_price") or item.get("price") or {}
-    amount = price.get("amount")
-    currency = price.get("currency_code", "")
-    if amount is None:
-        return "?"
-    return f"{amount} {currency}"
-
-
-def build_embed(item: dict, domain: str) -> discord.Embed:
-    item_id = item.get("id")
-    title = item.get("title") or "Nouvelle annonce"
-    url = f"https://{domain}/items/{item_id}"
-    embed = discord.Embed(title=title[:256], url=url, color=discord.Color.green())
-    embed.add_field(name="Prix", value=format_price(item), inline=True)
-    size = item.get("size_title")
-    if size:
-        embed.add_field(name="Taille", value=size, inline=True)
-    brand = item.get("brand_title")
-    if brand:
-        embed.add_field(name="Marque", value=brand, inline=True)
-    photo = item.get("photo") or {}
-    photo_url = photo.get("url")
-    if photo_url:
-        embed.set_thumbnail(url=photo_url)
-    user = item.get("user") or {}
-    if user.get("login"):
-        embed.set_footer(text=f"Vendeur : {user['login']}")
+def build_embed(item: dict) -> discord.Embed:
+    embed = discord.Embed(title=item["title"][:256], url=item["url"], color=discord.Color.green())
+    embed.add_field(name="Prix", value=item["price"], inline=True)
+    if item.get("extra"):
+        embed.add_field(name="Détails", value=item["extra"][:1024], inline=False)
+    if item.get("photo"):
+        embed.set_thumbnail(url=item["photo"])
     return embed
 
 
@@ -332,20 +342,25 @@ class VintedBot(discord.Client):
             await self.close()
             return
 
+    async def _sync_guild(self, guild: discord.Guild) -> None:
+        # Les commandes sont enregistrées globalement (self.tree.add_command sans
+        # guild=) ; il faut les copier explicitement vers chaque serveur pour
+        # qu'elles y soient disponibles immédiatement (la sync globale seule met
+        # jusqu'à 1h à se propager).
+        try:
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            log.info("Commandes slash synchronisées sur '%s' (%d commande(s)).", guild.name, len(synced))
+        except discord.HTTPException as exc:
+            log.warning("Échec de synchronisation des commandes sur '%s': %s", guild.name, exc)
+
     async def on_ready(self):
         log.info("Connecté en tant que %s", self.user)
         for guild in self.guilds:
-            try:
-                synced = await self.tree.sync(guild=guild)
-                log.info("Commandes slash synchronisées sur '%s' (%d commande(s)).", guild.name, len(synced))
-            except discord.HTTPException as exc:
-                log.warning("Échec de synchronisation des commandes sur '%s': %s", guild.name, exc)
+            await self._sync_guild(guild)
 
     async def on_guild_join(self, guild: discord.Guild):
-        try:
-            await self.tree.sync(guild=guild)
-        except discord.HTTPException as exc:
-            log.warning("Échec de synchronisation des commandes sur '%s': %s", guild.name, exc)
+        await self._sync_guild(guild)
 
     @tasks.loop(seconds=60)
     async def poll_searches(self):
@@ -390,7 +405,7 @@ class VintedBot(discord.Client):
             return
 
         for item in reversed(new_items):
-            embed = build_embed(item, domain)
+            embed = build_embed(item)
             role_id = dest["role_id"]
             try:
                 await channel.send(
