@@ -1,6 +1,8 @@
 {
   "discord_token": "COLLE_ICI_LE_TOKEN_DE_TON_BOT",
   "check_interval_seconds": 60,
+  "daily_restart_hour": 4,
+  "restart_timezone": "Europe/Paris",
   "destinations": [
     {
       "name": "Serveur des potes",

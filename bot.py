@@ -1,11 +1,14 @@
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse, parse_qsl
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import tasks
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -41,6 +44,10 @@ def load_seen() -> dict:
 
 def save_seen(seen: dict) -> None:
     SEEN_PATH.write_text(json.dumps(seen), encoding="utf-8")
+
+
+def save_config(config: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def build_search(url: str, _depth: int = 0) -> dict:
@@ -159,22 +166,186 @@ class VintedBot(discord.Client):
                 "channel_id": dest["channel_id"],
                 "role_id": dest["role_id"],
                 "searches": [
-                    {"name": s["name"], **build_search(s["url"])} for s in dest["searches"]
+                    {"name": s["name"], "url": s["url"], **build_search(s["url"])}
+                    for s in dest.get("searches", [])
                 ],
             }
             for i, dest in enumerate(config["destinations"])
         ]
         self.vinted = VintedClient()
         self.seen = load_seen()
+        self.tree = app_commands.CommandTree(self)
+        self._register_commands()
+
+    def _find_destination(self, channel_id: int) -> dict | None:
+        return next((d for d in self.destinations if d["channel_id"] == channel_id), None)
+
+    def _serialize_destinations(self) -> list[dict]:
+        return [
+            {
+                "name": d["name"],
+                "channel_id": d["channel_id"],
+                "role_id": d["role_id"],
+                "searches": [{"name": s["name"], "url": s["url"]} for s in d["searches"]],
+            }
+            for d in self.destinations
+        ]
+
+    def _save(self) -> None:
+        self.config["destinations"] = self._serialize_destinations()
+        save_config(self.config)
+
+    def _register_commands(self) -> None:
+        group = app_commands.Group(name="vinted", description="Gérer les recherches Vinted de ce salon")
+
+        @group.command(name="add", description="Ajouter une recherche Vinted à ce salon")
+        @app_commands.describe(
+            nom="Nom de la recherche (libre, sert juste à l'identifier)",
+            url="URL de recherche Vinted copiée depuis la barre d'adresse (avec tes filtres)",
+            role="Rôle à ping (obligatoire seulement pour la toute première recherche de ce salon)",
+        )
+        async def add(interaction: discord.Interaction, nom: str, url: str, role: discord.Role | None = None):
+            await self._cmd_add(interaction, nom, url, role)
+
+        @group.command(name="remove", description="Retirer une recherche Vinted de ce salon")
+        @app_commands.describe(nom="Nom de la recherche à retirer (voir /vinted list)")
+        async def remove(interaction: discord.Interaction, nom: str):
+            await self._cmd_remove(interaction, nom)
+
+        @group.command(name="list", description="Lister les recherches Vinted actives dans ce salon")
+        async def list_(interaction: discord.Interaction):
+            await self._cmd_list(interaction)
+
+        self.tree.add_command(group)
+
+    @staticmethod
+    def _has_permission(interaction: discord.Interaction) -> bool:
+        return (
+            interaction.guild is not None
+            and isinstance(interaction.user, discord.Member)
+            and interaction.user.guild_permissions.manage_guild
+        )
+
+    async def _cmd_add(
+        self, interaction: discord.Interaction, nom: str, url: str, role: discord.Role | None
+    ) -> None:
+        if not self._has_permission(interaction):
+            await interaction.response.send_message(
+                "Il te faut la permission **Gérer le serveur** pour ça.", ephemeral=True
+            )
+            return
+
+        dest = self._find_destination(interaction.channel_id)
+        if dest is None:
+            if role is None:
+                await interaction.response.send_message(
+                    "Ce salon n'a pas encore de recherche configurée : précise le paramètre "
+                    "`role` (le rôle à ping) pour en créer une.",
+                    ephemeral=True,
+                )
+                return
+            dest = {
+                "name": f"{interaction.guild.name} / #{interaction.channel.name}",
+                "channel_id": interaction.channel_id,
+                "role_id": role.id,
+                "searches": [],
+            }
+            self.destinations.append(dest)
+        elif role is not None:
+            dest["role_id"] = role.id
+
+        if any(s["name"].lower() == nom.lower() for s in dest["searches"]):
+            await interaction.response.send_message(
+                f"Une recherche nommée **{nom}** existe déjà dans ce salon.", ephemeral=True
+            )
+            return
+
+        built = build_search(url)
+        if "vinted" not in built["domain"].lower():
+            await interaction.response.send_message(
+                f"L'URL fournie ne semble pas être une URL Vinted valide "
+                f"(domaine détecté : `{built['domain']}`).",
+                ephemeral=True,
+            )
+            return
+
+        dest["searches"].append({"name": nom, "url": url, **built})
+        self._save()
+        await interaction.response.send_message(
+            f"✅ Recherche **{nom}** ajoutée à ce salon (ping <@&{dest['role_id']}>).",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _cmd_remove(self, interaction: discord.Interaction, nom: str) -> None:
+        if not self._has_permission(interaction):
+            await interaction.response.send_message(
+                "Il te faut la permission **Gérer le serveur** pour ça.", ephemeral=True
+            )
+            return
+
+        dest = self._find_destination(interaction.channel_id)
+        match = next((s for s in dest["searches"] if s["name"].lower() == nom.lower()), None) if dest else None
+        if match is None:
+            await interaction.response.send_message(
+                f"Aucune recherche nommée **{nom}** dans ce salon (voir `/vinted list`).", ephemeral=True
+            )
+            return
+
+        dest["searches"].remove(match)
+        self.seen.pop(f"{dest['name']}::{match['name']}", None)
+        save_seen(self.seen)
+        self._save()
+        await interaction.response.send_message(f"🗑️ Recherche **{match['name']}** retirée de ce salon.")
+
+    async def _cmd_list(self, interaction: discord.Interaction) -> None:
+        dest = self._find_destination(interaction.channel_id)
+        if dest is None or not dest["searches"]:
+            await interaction.response.send_message("Aucune recherche configurée dans ce salon.", ephemeral=True)
+            return
+
+        lines = [f"• **{s['name']}** — {s['domain']}" for s in dest["searches"]]
+        await interaction.response.send_message(
+            f"Recherches actives dans ce salon (ping <@&{dest['role_id']}>) :\n" + "\n".join(lines),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def setup_hook(self) -> None:
         await self.vinted.start()
         interval = self.config.get("check_interval_seconds", 60)
         self.poll_searches.change_interval(seconds=interval)
         self.poll_searches.start()
+        asyncio.create_task(self._daily_restart_loop())
+
+    async def _daily_restart_loop(self) -> None:
+        hour = self.config.get("daily_restart_hour", 4)
+        tz = ZoneInfo(self.config.get("restart_timezone", "Europe/Paris"))
+        while True:
+            now = datetime.now(tz)
+            target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            wait_seconds = (target - now).total_seconds()
+            log.info("Prochain redémarrage quotidien programmé à %s (dans %.0f min).", target.isoformat(), wait_seconds / 60)
+            await asyncio.sleep(wait_seconds)
+            log.info("Redémarrage quotidien programmé : arrêt du bot (Docker le relance automatiquement).")
+            await self.close()
+            return
 
     async def on_ready(self):
         log.info("Connecté en tant que %s", self.user)
+        for guild in self.guilds:
+            try:
+                synced = await self.tree.sync(guild=guild)
+                log.info("Commandes slash synchronisées sur '%s' (%d commande(s)).", guild.name, len(synced))
+            except discord.HTTPException as exc:
+                log.warning("Échec de synchronisation des commandes sur '%s': %s", guild.name, exc)
+
+    async def on_guild_join(self, guild: discord.Guild):
+        try:
+            await self.tree.sync(guild=guild)
+        except discord.HTTPException as exc:
+            log.warning("Échec de synchronisation des commandes sur '%s': %s", guild.name, exc)
 
     @tasks.loop(seconds=60)
     async def poll_searches(self):
@@ -238,13 +409,14 @@ class VintedBot(discord.Client):
 async def main():
     config = load_config()
     if not config.get("destinations"):
-        raise SystemExit(
-            "Ajoute au moins une destination dans config.json (section 'destinations'), "
-            "chacune avec son channel_id, role_id et ses propres 'searches'."
+        log.warning(
+            "Aucune destination dans config.json pour l'instant — utilise /vinted add "
+            "dans un salon Discord pour en créer une."
         )
+        config["destinations"] = []
     for dest in config["destinations"]:
         if not dest.get("searches"):
-            raise SystemExit(f"La destination '{dest.get('name')}' n'a aucune recherche configurée.")
+            log.warning("La destination '%s' n'a aucune recherche configurée pour l'instant.", dest.get("name"))
 
     bot = VintedBot(config)
     try:

@@ -4,5 +4,5 @@ services:
     container_name: vinted-bot
     restart: unless-stopped
     volumes:
-      - ./config.json:/app/config.json:ro
+      - ./config.json:/app/config.json
       - ./seen_items.json:/app/seen_items.json

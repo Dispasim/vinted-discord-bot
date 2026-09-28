@@ -11,10 +11,16 @@ dans un salon Discord dès qu'une nouvelle annonce correspondant à tes critère
 3. Copie le **Token** (bouton "Reset Token" si besoin) : tu en auras besoin pour `config.json`.
    Ne le partage jamais publiquement.
 4. Onglet **OAuth2 → URL Generator** :
-   - Scopes : `bot`
+   - Scopes : `bot` **et** `applications.commands` (ce second scope est nécessaire
+     pour que les commandes slash `/vinted add`, `/vinted remove`, `/vinted list`
+     apparaissent sur le serveur)
    - Bot Permissions : `Send Messages`, `Embed Links`, `Mention Everyone` (nécessaire
      pour que le bot puisse ping un rôle même s'il n'est pas "mentionnable" par tout le monde)
 5. Ouvre l'URL générée, choisis ton serveur et invite le bot.
+
+   Si le bot était déjà invité avant l'ajout des commandes slash (sans le scope
+   `applications.commands`), réinvite-le avec la nouvelle URL : Discord ajoute
+   simplement le scope manquant, sans dupliquer le bot ni perdre sa config.
 
 ## 2. Récupérer les IDs Discord
 
@@ -41,6 +47,8 @@ cp config.example.json config.json
 {
   "discord_token": "TON_TOKEN_BOT",
   "check_interval_seconds": 60,
+  "daily_restart_hour": 4,
+  "restart_timezone": "Europe/Paris",
   "destinations": [
     {
       "name": "Serveur des potes",
@@ -80,6 +88,13 @@ chacun des serveurs concernés.
 
 `check_interval_seconds` : fréquence de vérification (60s est un bon compromis ;
 ne descends pas trop bas pour éviter d'être bloqué par Vinted).
+
+`daily_restart_hour` / `restart_timezone` : le bot se redémarre lui-même une fois
+par jour à l'heure locale indiquée (4h du matin par défaut, fuseau `Europe/Paris`).
+Ça repart avec une session/des cookies Vinted frais, ce qui aide à éviter les
+blocages progressifs. Le redémarrage est géré par `restart: unless-stopped` dans
+`docker-compose.yml` : le bot s'arrête proprement, et Docker le relance aussitôt
+automatiquement (aucune coupure de service côté hébergement).
 
 ## 5. Installer et lancer
 
@@ -151,6 +166,27 @@ automatiquement la bonne variante.
 Au premier lancement pour une recherche donnée, le bot enregistre les annonces
 déjà en ligne sans les notifier (pour éviter un spam massif au démarrage).
 Ensuite, seules les **nouvelles** annonces déclenchent un ping.
+
+## 6. Gérer les recherches directement depuis Discord
+
+Une fois le bot en ligne et invité avec le scope `applications.commands` (voir
+étape 1), trois commandes slash sont disponibles dans n'importe quel salon —
+seuls les membres avec la permission **Gérer le serveur** peuvent les utiliser :
+
+- **`/vinted add nom:<...> url:<...> role:<@role>`** — ajoute une recherche
+  dans le salon où la commande est tapée. Le paramètre `role` n'est obligatoire
+  que pour la toute première recherche d'un salon (il crée alors une nouvelle
+  "destination") ; pour les recherches suivantes dans le même salon, omets-le
+  (le rôle déjà configuré est réutilisé), ou fournis-le pour le changer.
+- **`/vinted remove nom:<...>`** — retire une recherche du salon courant.
+- **`/vinted list`** — liste les recherches actives dans le salon courant.
+
+Chaque ajout/suppression est immédiatement sauvegardé dans `config.json` — pas
+besoin de redémarrer le bot pour que ça prenne effet.
+
+Si les commandes n'apparaissent pas tout de suite dans Discord, patiente
+quelques secondes (elles se synchronisent au démarrage du bot et à chaque fois
+qu'il rejoint un nouveau serveur) ou retape `/` dans le salon pour rafraîchir.
 
 ## Notes
 
