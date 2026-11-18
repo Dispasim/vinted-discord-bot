@@ -3,6 +3,7 @@ import html
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse, parse_qsl
@@ -113,9 +114,15 @@ def parse_items_from_html(body: str, domain: str) -> list[dict]:
     return items
 
 
+BLOCK_BASE_COOLDOWN = 300
+BLOCK_MAX_COOLDOWN = 3600
+
+
 class VintedClient:
     def __init__(self):
         self._session: aiohttp.ClientSession | None = None
+        self._blocked_until: dict[str, float] = {}
+        self._block_count: dict[str, int] = {}
 
     async def start(self):
         self._session = aiohttp.ClientSession(
@@ -130,13 +137,28 @@ class VintedClient:
             await self._session.close()
 
     async def fetch_items(self, domain: str, params: dict) -> list[dict]:
+        if time.monotonic() < self._blocked_until.get(domain, 0):
+            return []
+
         url = f"https://{domain}/catalog"
         for attempt in range(2):
             try:
                 async with self._session.get(
                     url, params=params, timeout=aiohttp.ClientTimeout(total=20)
                 ) as resp:
+                    if resp.status in (403, 429):
+                        # Réessayer tout de suite aggrave le blocage : on met le domaine en pause.
+                        count = self._block_count.get(domain, 0) + 1
+                        self._block_count[domain] = count
+                        cooldown = min(BLOCK_BASE_COOLDOWN * 2 ** (count - 1), BLOCK_MAX_COOLDOWN)
+                        self._blocked_until[domain] = time.monotonic() + cooldown
+                        log.warning(
+                            "Vinted a répondu %s pour %s (IP probablement bloquée) : pause de %d min.",
+                            resp.status, domain, cooldown // 60,
+                        )
+                        return []
                     if resp.status == 200:
+                        self._block_count.pop(domain, None)
                         body = await resp.text()
                         items = parse_items_from_html(body, domain)
                         if not items:
